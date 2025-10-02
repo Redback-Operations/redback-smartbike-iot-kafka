@@ -30,13 +30,30 @@ app.use(
 
 app.use(express.json());
 
-// Initialize Kafka client
+// Initialize Kafka client with enhanced configuration
 const kafka = new Kafka({
   clientId: 'websocket-kafka-bridge',
   brokers: [process.env.KAFKA_BOOTSTRAP_SERVERS || 'localhost:9092'],
+  retry: {
+    initialRetryTime: 100,
+    retries: 5,
+    maxRetryTime: 30000,
+    factor: 2,
+    multiplier: 2,
+  },
+  connectionTimeout: 3000,
+  requestTimeout: 30000,
 });
 
-const consumer = kafka.consumer({ groupId: 'websocket-bridge-group' });
+const consumer = kafka.consumer({ 
+  groupId: 'websocket-bridge-group',
+  sessionTimeout: 30000,
+  heartbeatInterval: 3000,
+  maxWaitTimeInMs: 5000,
+  retry: {
+    retries: 3,
+  }
+});
 const producer = kafka.producer();
 
 // Device type mapping
@@ -50,8 +67,32 @@ const DEVICE_TYPES = [
   'fan',
 ];
 
-// Store active WebSocket connections
-const activeConnections = new Map<string, any>();
+// Enhanced connection tracking interface
+interface ConnectionInfo {
+  id: string;
+  type: 'websocket' | 'sse';
+  connectedAt: Date;
+  lastActivity: Date;
+  subscriptions: Set<string>;
+  deviceId?: string;
+  connection: any; // Store the actual connection object
+}
+
+// Store active WebSocket connections with enhanced tracking
+const activeConnections = new Map<string, ConnectionInfo>();
+
+// Connection cleanup interval
+setInterval(() => {
+  const now = new Date();
+  const staleThreshold = 5 * 60 * 1000; // 5 minutes
+
+  activeConnections.forEach((connectionInfo, id) => {
+    if (now.getTime() - connectionInfo.lastActivity.getTime() > staleThreshold) {
+      console.log(`🧹 Removing stale connection: ${id}`);
+      activeConnections.delete(id);
+    }
+  });
+}, 60 * 1000); // Check every minute
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -79,9 +120,18 @@ app.get('/events', (req, res) => {
     'data: {"type":"connected","message":"SSE connection established"}\n\n'
   );
 
-  // Store connection
+  // Store connection with enhanced tracking
   const connectionId = `sse_${Date.now()}`;
-  activeConnections.set(connectionId, res);
+  const connectionInfo: ConnectionInfo = {
+    id: connectionId,
+    type: 'sse',
+    connectedAt: new Date(),
+    lastActivity: new Date(),
+    subscriptions: new Set(),
+    connection: res,
+  };
+  
+  activeConnections.set(connectionId, connectionInfo);
 
   // Handle client disconnect
   req.on('close', () => {
@@ -92,17 +142,29 @@ app.get('/events', (req, res) => {
   console.log(`SSE client connected: ${connectionId}`);
 });
 
-// WebSocket connection handling
+// Enhanced WebSocket connection handling
 io.on('connection', (socket) => {
   console.log(`WebSocket client connected: ${socket.id}`);
 
-  // Store WebSocket connection
-  activeConnections.set(socket.id, socket);
+  // Store WebSocket connection with enhanced tracking
+  const connectionInfo: ConnectionInfo = {
+    id: socket.id,
+    type: 'websocket',
+    connectedAt: new Date(),
+    lastActivity: new Date(),
+    subscriptions: new Set(),
+    connection: socket,
+  };
+  
+  activeConnections.set(socket.id, connectionInfo);
 
-  // Handle device subscription
+  // Enhanced device subscription handling
   socket.on(
     'subscribe',
     (data: { deviceId: string; deviceTypes?: string[] }) => {
+      const connectionInfo = activeConnections.get(socket.id);
+      if (!connectionInfo) return;
+
       const { deviceId, deviceTypes = DEVICE_TYPES } = data;
 
       console.log(
@@ -113,9 +175,14 @@ io.on('connection', (socket) => {
         )}`
       );
 
+      // Update connection info
+      connectionInfo.deviceId = deviceId;
+      connectionInfo.lastActivity = new Date();
+
       // Join rooms for specific device and types
       deviceTypes.forEach((type) => {
         const room = `device_${deviceId}_${type}`;
+        connectionInfo.subscriptions.add(room);
         socket.join(room);
       });
 
@@ -162,16 +229,15 @@ io.on('connection', (socket) => {
   });
 });
 
-// Kafka consumer to forward messages to WebSocket clients
+// Enhanced Kafka consumer to forward messages to WebSocket clients
 const startKafkaConsumer = async () => {
   try {
     await consumer.connect();
     console.log('✅ Kafka consumer connected');
 
-    // Subscribe to all sensor data topics
+    // Subscribe to all sensor data topics with pattern matching
     const topics = [];
-    for (const deviceId of ['000001']) {
-      // Add more device IDs as needed
+    for (const deviceId of ['000001', '*']) { // Add wildcard pattern support
       for (const type of DEVICE_TYPES) {
         topics.push(`bike.${deviceId}.${type}`);
         topics.push(`bike.${deviceId}.${type}.report`);
@@ -179,12 +245,22 @@ const startKafkaConsumer = async () => {
     }
 
     await consumer.subscribe({ topics });
-    console.log('✅ Subscribed to Kafka topics:', topics);
+    console.log('✅ Subscribed to enhanced Kafka topics:', topics);
 
     await consumer.run({
-      eachMessage: async ({ topic, message }: EachMessagePayload) => {
+      partitionsConsumedConcurrently: 2, // Process multiple partitions
+      eachMessage: async ({ topic, message, heartbeat }: EachMessagePayload) => {
         try {
-          const data = JSON.parse(message.value?.toString() || '{}');
+          // Call heartbeat to prevent session timeout
+          await heartbeat();
+
+          const messageValue = message.value?.toString();
+          if (!messageValue) {
+            console.warn(`⚠️ Empty message received from topic ${topic}`);
+            return;
+          }
+
+          const data = JSON.parse(messageValue);
 
           // Extract device info from topic
           const topicParts = topic.split('.');
@@ -198,20 +274,32 @@ const startKafkaConsumer = async () => {
               deviceId,
               deviceType,
               isReport,
-              data,
-              timestamp: new Date().toISOString(),
+              data: {
+                ...data,
+                timestamp: data.timestamp || new Date().toISOString(),
+                messageId: data.messageId || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              },
+              receivedAt: new Date().toISOString(),
             };
 
             // Send to WebSocket clients in relevant rooms
             const room = `device_${deviceId}_${deviceType}`;
             io.to(room).emit('sensor_data', messageData);
 
+            // Update activity for connected clients
+            activeConnections.forEach((connectionInfo) => {
+              if (connectionInfo.type === 'websocket' && connectionInfo.subscriptions.has(room)) {
+                connectionInfo.lastActivity = new Date();
+              }
+            });
+
             // Send to SSE clients
             const sseMessage = `data: ${JSON.stringify(messageData)}\n\n`;
-            activeConnections.forEach((connection, id) => {
+            activeConnections.forEach((connectionInfo, id) => {
               if (id.startsWith('sse_')) {
                 try {
-                  connection.write(sseMessage);
+                  connectionInfo.connection.write(sseMessage);
+                  connectionInfo.lastActivity = new Date();
                 } catch (error) {
                   console.error(`Error sending SSE message to ${id}:`, error);
                   activeConnections.delete(id);
@@ -220,16 +308,16 @@ const startKafkaConsumer = async () => {
             });
 
             console.log(
-              `📡 Forwarded ${topic} to ${activeConnections.size} clients`
+              `📡 Enhanced forwarded ${topic} to ${activeConnections.size} clients`
             );
           }
         } catch (error) {
-          console.error('Error processing Kafka message:', error);
+          console.error('❌ Error processing enhanced Kafka message:', error);
         }
       },
     });
   } catch (error) {
-    console.error('❌ Error starting Kafka consumer:', error);
+    console.error('❌ Error starting enhanced Kafka consumer:', error);
     process.exit(1);
   }
 };
