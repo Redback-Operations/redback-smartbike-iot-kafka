@@ -29,6 +29,16 @@ app.get('/', (req, res) => {
   res.send('The sensor data API server is running now...')
 })
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date(),
+    uptime: process.uptime(),
+    service: 'sensors-backend-kafka'
+  })
+})
+
 // apply a basic auth for all APIs
 // TODO: apply a better Auth mechanism if needed later
 app.use(
